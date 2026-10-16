@@ -1,0 +1,71 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+import yfinance as yf
+import pandas as pd
+from backtesting import Backtest, Strategy
+from IPython.display import display
+
+# ---------------- Settings ----------------
+TICKERS = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"]
+START = "2021-01-01"
+END = "2026-09-30"
+CASH = 200_000
+# ------------------------------------------
+
+def RSI(close, n=14):
+    close = pd.Series(close)
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
+    return 100 - 100 / (1 + gain / loss)
+
+class RSIStrategy(Strategy):
+    n = 14          # RSI period
+    lower = 30      # buy below this
+    upper = 70      # sell above this
+    stop = 0.07     # 7% stop loss
+
+    def init(self):
+        self.rsi = self.I(RSI, self.data.Close, self.n, name="RSI")
+
+    def next(self):
+        price = self.data.Close[-1]
+        if not self.position and self.rsi[-1] < self.lower:
+            self.buy(sl=price * (1 - self.stop))
+        elif self.position and self.rsi[-1] > self.upper:
+            self.position.close()
+
+for t in TICKERS:
+    df = yf.Ticker(f"{t}.NS").history(start=START, end=END, auto_adjust=True)
+    if df.empty:
+        print(f"No data for {t}")
+        continue
+    df.index = df.index.tz_localize(None)
+
+    bt = Backtest(df, RSIStrategy, cash=CASH, commission=0.0012)
+    stats = bt.run()
+
+    print(f"\n===== {t} =====")
+    print(f"Return {stats['Return [%]']:.1f}%  |  Buy & Hold {stats['Buy & Hold Return [%]']:.1f}%  |  "
+          f"Trades {stats['# Trades']}  |  Win rate {stats['Win Rate [%]']:.1f}%  |  "
+          f"Max DD {stats['Max. Drawdown [%]']:.1f}%")
+
+    bt.plot(resample=False, superimpose=False, plot_return=False, plot_drawdown=False)
+
+    tr = stats["_trades"]
+    if tr.empty:
+        print("No trades")
+        continue
+    table = pd.DataFrame({
+        "Entry Date":  tr["EntryTime"].dt.date,
+        "Entry Price": tr["EntryPrice"].round(2),
+        "Exit Date":   tr["ExitTime"].dt.date,
+        "Exit Price":  tr["ExitPrice"].round(2),
+        "Shares":      tr["Size"],
+        "Return %":    (tr["ReturnPct"] * 100).round(2),
+        "P&L ₹":       tr["PnL"].round(0),
+        "Days Held":   tr["Duration"].dt.days,
+    })
+    display(table.style.map(
+        lambda v: "color: green" if v > 0 else "color: red", subset=["Return %", "P&L ₹"]))

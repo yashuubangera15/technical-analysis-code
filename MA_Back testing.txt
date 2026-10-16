@@ -1,0 +1,68 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+import yfinance as yf
+import pandas as pd
+from backtesting import Backtest, Strategy
+from backtesting.lib import crossover
+from IPython.display import display
+
+# ---------------- Settings ----------------
+TICKERS = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"]
+START = "2021-01-01"
+END = "2026-09-30"
+CASH = 200_000
+FAST, SLOW = 50, 200
+# ------------------------------------------
+
+class GoldenCross(Strategy):
+    def init(self):
+        self.fast = self.I(lambda x: x, self.data.SMA_FAST, name=f"SMA {FAST}")
+        self.slow = self.I(lambda x: x, self.data.SMA_SLOW, name=f"SMA {SLOW}")
+
+    def next(self):
+        if not self.position and crossover(self.fast, self.slow):
+            self.buy()
+        elif self.position and crossover(self.slow, self.fast):
+            self.position.close()
+
+# Download extra history so the 200-day MA is ready on START
+warmup_start = (pd.Timestamp(START) - pd.DateOffset(days=int(SLOW * 1.6))).strftime("%Y-%m-%d")
+
+for t in TICKERS:
+    df = yf.Ticker(f"{t}.NS").history(start=warmup_start, end=END, auto_adjust=True)
+    if df.empty:
+        print(f"No data for {t}")
+        continue
+    df.index = df.index.tz_localize(None)
+
+    df["SMA_FAST"] = df["Close"].rolling(FAST).mean()
+    df["SMA_SLOW"] = df["Close"].rolling(SLOW).mean()
+    df = df.loc[START:]            # test only from START onwards
+
+    bt = Backtest(df, GoldenCross, cash=CASH, commission=0.0012)
+    stats = bt.run()
+
+    print(f"\n===== {t} =====")
+    print(f"Return {stats['Return [%]']:.1f}%  |  Buy & Hold {stats['Buy & Hold Return [%]']:.1f}%  |  "
+          f"Trades {stats['# Trades']}  |  Win rate {stats['Win Rate [%]']:.1f}%  |  "
+          f"Max DD {stats['Max. Drawdown [%]']:.1f}%")
+
+    bt.plot(resample=False, superimpose=False, plot_return=False, plot_drawdown=False)
+
+    tr = stats["_trades"]
+    if tr.empty:
+        print("No completed trades")
+        continue
+    table = pd.DataFrame({
+        "Entry Date":  tr["EntryTime"].dt.date,
+        "Entry Price": tr["EntryPrice"].round(2),
+        "Exit Date":   tr["ExitTime"].dt.date,
+        "Exit Price":  tr["ExitPrice"].round(2),
+        "Shares":      tr["Size"],
+        "Return %":    (tr["ReturnPct"] * 100).round(2),
+        "P&L ₹":       tr["PnL"].round(0),
+        "Days Held":   tr["Duration"].dt.days,
+    })
+    display(table.style.map(
+        lambda v: "color: green" if v > 0 else "color: red", subset=["Return %", "P&L ₹"]))

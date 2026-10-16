@@ -1,0 +1,63 @@
+%pip install -q backtesting yfinance
+%pip install -q backtesting yfinance
+import warnings
+warnings.filterwarnings("ignore")
+
+import yfinance as yf
+import pandas as pd
+from backtesting import Backtest, Strategy
+from IPython.display import display
+
+# ---------------- Settings ----------------
+TICKERS = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"]
+START = "2021-01-01"
+END = "2026-09-30"
+CASH = 200_000
+# ------------------------------------------
+
+class ThreeRedDays(Strategy):
+    def init(self):
+        pass
+
+    def next(self):
+        if len(self.data) < 3 or self.position:
+            return
+        if all(self.data.Close[-k] < self.data.Open[-k] for k in (1, 2, 3)):
+            price = self.data.Close[-1]
+            self.buy(sl=price * 0.93, tp=price * 1.10)
+
+for t in TICKERS:
+    df = yf.Ticker(f"{t}.NS").history(start=START, end=END, auto_adjust=True)
+    if df.empty:
+        print(f"No data for {t}")
+        continue
+    df.index = df.index.tz_localize(None)
+
+    bt = Backtest(df, ThreeRedDays, cash=CASH, commission=0.0012)
+    stats = bt.run()
+
+    print(f"\n===== {t} =====")
+    print(f"Return {stats['Return [%]']:.1f}%  |  Buy & Hold {stats['Buy & Hold Return [%]']:.1f}%  |  "
+          f"Trades {stats['# Trades']}  |  Win rate {stats['Win Rate [%]']:.1f}%")
+
+    # 1) Daily candlestick chart with entries/exits
+    bt.plot(resample=False, superimpose=False, plot_equity=True,
+            plot_return=False, plot_volume=True, plot_drawdown=False)
+
+    # 2) Trades table
+    tr = stats["_trades"]
+    if tr.empty:
+        print("No trades")
+        continue
+    table = pd.DataFrame({
+        "Entry Date":  tr["EntryTime"].dt.date,
+        "Entry Price": tr["EntryPrice"].round(2),
+        "Exit Date":   tr["ExitTime"].dt.date,
+        "Exit Price":  tr["ExitPrice"].round(2),
+        "Shares":      tr["Size"],
+        "Return %":    (tr["ReturnPct"] * 100).round(2),
+        "P&L ₹":       tr["PnL"].round(0),
+        "Days Held":   tr["Duration"].dt.days,
+    })
+    display(table.style.map(
+        lambda v: "color: green" if v > 0 else "color: red", subset=["Return %", "P&L ₹"]))
