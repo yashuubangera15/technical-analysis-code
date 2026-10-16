@@ -1,0 +1,758 @@
+#Step 1
+import requests
+import pandas as pd
+import io
+
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/csv,application/csv,*/*",
+}
+
+nifty200_url = "https://www.niftyindices.com/IndexConstituent/ind_nifty200list.csv"
+
+try:
+    response = requests.get(nifty200_url, headers=headers, timeout=15)
+    response.raise_for_status()
+    nifty200 = pd.read_csv(io.StringIO(response.text))
+    print(nifty200.head())
+    print(f"\nTotal constituents: {len(nifty200)}")
+except Exception as e:
+    print(f"Failed: {type(e).__name__} - {e}")
+
+#Step2
+import yfinance as yf
+import pandas as pd
+import numpy as np
+
+# Build tickers from the Nifty 200 list we just pulled
+tickers_200 = [symbol + ".NS" for symbol in nifty200["Symbol"]]
+print(f"Attempting to download {len(tickers_200)} tickers...")
+
+# Download 2 years of close prices for all 200
+data_200 = yf.download(tickers_200, period="2y", auto_adjust=True, threads=True)["Close"]
+
+# Diagnostics — same checks that saved us earlier
+print(f"\nColumns returned: {data_200.shape[1]} of {len(tickers_200)} requested")
+
+fully_missing = [t for t in tickers_200 if t not in data_200.columns or data_200[t].isna().all()]
+print(f"Fully missing/empty tickers ({len(fully_missing)}): {fully_missing}")
+
+# Drop fully empty columns, forward-fill small gaps (same fix as before)
+data_200 = data_200.dropna(axis=1, how="all")
+data_200 = data_200.ffill()
+
+# Check remaining data quality
+null_counts = data_200.isna().sum()
+still_gappy = null_counts[null_counts > 0]
+print(f"\nTickers with remaining gaps after ffill: {len(still_gappy)}")
+if len(still_gappy) > 0:
+    print(still_gappy.head(10))
+
+print(f"\nFinal usable universe: {data_200.shape[1]} stocks, {len(data_200)} trading days")
+print(f"Date range: {data_200.index.min()} to {data_200.index.max()}")
+
+
+#Step 3:
+def calculate_rsi(prices, period=14):
+    delta = prices.diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+rsi_results = []
+for ticker in data_200.columns:
+    rsi_series = calculate_rsi(data_200[ticker])
+    latest_rsi = rsi_series.iloc[-1]
+    if pd.isna(latest_rsi):
+        continue  # skip stocks without enough history for even a 14-day RSI
+
+    if latest_rsi > 70:
+        signal = "Strong buying pressure (overbought watch)"
+    elif latest_rsi > 50:
+        signal = "Bullish momentum"
+    else:
+        signal = "Weak/bearish"
+
+    rsi_results.append({"ticker": ticker, "rsi": round(latest_rsi, 2), "signal": signal})
+
+rsi_table = pd.DataFrame(rsi_results).set_index("ticker").sort_values("rsi", ascending=False)
+
+print(f"RSI computed for {len(rsi_table)} of 200 stocks\n")
+print("=== Top 15 by RSI ===")
+print(rsi_table.head(15))
+print("\n=== Bottom 15 by RSI ===")
+print(rsi_table.tail(15))
+
+print(f"\n=== Summary ===")
+print(f"RSI > 70 (overbought): {(rsi_table['rsi'] > 70).sum()} stocks")
+print(f"RSI 50-70 (bullish): {((rsi_table['rsi'] > 50) & (rsi_table['rsi'] <= 70)).sum()} stocks")
+print(f"RSI < 50 (weak/bearish): {(rsi_table['rsi'] <= 50).sum()} stocks")
+
+# Step 4:
+original_five = ["UPL.NS", "COALINDIA.NS", "TATACONSUM.NS", "JSWSTEEL.NS", "NTPC.NS"]
+rsi_table.loc[rsi_table.index.intersection(original_five)]
+
+#Step5:
+for ticker in original_five:
+    if ticker in rsi_table.index:
+        rank = (rsi_table['rsi'] < rsi_table.loc[ticker, 'rsi']).sum()
+        percentile = rank / len(rsi_table) * 100
+        print(f"{ticker}: RSI {rsi_table.loc[ticker,'rsi']:.2f} — {percentile:.0f}th percentile of all 200 stocks")
+
+#Step6:
+
+def calculate_moving_averages(prices, short_window=50, long_window=200):
+    ma_short = prices.rolling(short_window).mean()
+    ma_long = prices.rolling(long_window).mean()
+    return ma_short, ma_long
+
+ma_results = []
+for ticker in data_200.columns:
+    ma50, ma200 = calculate_moving_averages(data_200[ticker])
+    latest_ma50 = ma50.iloc[-1]
+    latest_ma200 = ma200.iloc[-1]
+
+    if pd.isna(latest_ma50) or pd.isna(latest_ma200):
+        continue  # skip recent IPOs without 200 days of history yet
+
+    # % gap between the two MAs — a magnitude, not just a direction
+    pct_gap = ((latest_ma50 - latest_ma200) / latest_ma200) * 100
+
+    # Detect an actual crossover in the last 10 trading days, not just current position
+    diff = ma50 - ma200
+    recent_diff = diff.tail(10)
+    crossed_golden = (recent_diff.iloc[0] < 0) and (recent_diff.iloc[-1] > 0)
+    crossed_death = (recent_diff.iloc[0] > 0) and (recent_diff.iloc[-1] < 0)
+
+    if latest_ma50 > latest_ma200:
+        signal = "Golden Cross (recent!)" if crossed_golden else "Bullish trend"
+    else:
+        signal = "Death Cross (recent!)" if crossed_death else "Bearish trend"
+
+    ma_results.append({
+        "ticker": ticker, "ma_50": round(latest_ma50, 2), "ma_200": round(latest_ma200, 2),
+        "pct_gap": round(pct_gap, 2), "signal": signal
+    })
+
+ma_table = pd.DataFrame(ma_results).set_index("ticker").sort_values("pct_gap", ascending=False)
+
+print(f"Golden Cross test computed for {len(ma_table)} of 200 stocks")
+print(f"(Skipped: {200 - len(ma_table)} stocks without 200 days of history — recent IPOs)\n")
+
+print("=== Top 15 by MA gap (strongest bullish trend) ===")
+print(ma_table.head(15))
+print("\n=== Bottom 15 by MA gap (strongest bearish trend) ===")
+print(ma_table.tail(15))
+
+print(f"\n=== Summary ===")
+print(f"50 > 200 (bullish trend): {(ma_table['pct_gap'] > 0).sum()} stocks")
+print(f"50 < 200 (bearish trend): {(ma_table['pct_gap'] < 0).sum()} stocks")
+print(f"Recent Golden Crosses (last 10 days): {(ma_table['signal'] == 'Golden Cross (recent!)').sum()}")
+print(f"Recent Death Crosses (last 10 days): {(ma_table['signal'] == 'Death Cross (recent!)').sum()}")
+
+# Where do our original 5 stand?
+original_five = ["UPL.NS", "COALINDIA.NS", "TATACONSUM.NS", "JSWSTEEL.NS", "NTPC.NS"]
+print("\n=== Original 5, in context ===")
+for ticker in original_five:
+    if ticker in ma_table.index:
+        rank = (ma_table['pct_gap'] < ma_table.loc[ticker, 'pct_gap']).sum()
+        percentile = rank / len(ma_table) * 100
+        print(f"{ticker}: gap {ma_table.loc[ticker,'pct_gap']:.2f}% — {percentile:.0f}th percentile — {ma_table.loc[ticker,'signal']}")
+    else:
+        print(f"{ticker}: not enough history for 200-day MA")
+
+#step7
+
+ticker = "VEDL.NS"
+
+vedl_check = yf.download(ticker, period="2y", auto_adjust=True)["Close"]
+vedl_check = vedl_check.squeeze()  # ensures a plain Series, not a 1-column DataFrame
+
+print(f"VEDL.NS — {len(vedl_check)} trading days")
+print(f"Price 2 years ago: {vedl_check.iloc[0]:.2f}")
+print(f"Price today: {vedl_check.iloc[-1]:.2f}")
+print(f"Highest price in period: {vedl_check.max():.2f} on {vedl_check.idxmax()}")
+print(f"Lowest price in period: {vedl_check.min():.2f} on {vedl_check.idxmin()}")
+
+daily_pct_change = vedl_check.pct_change()
+big_moves = daily_pct_change[daily_pct_change.abs() > 0.15]
+print(f"\nDays with >15% single-day move (possible split/data issue): {len(big_moves)}")
+if len(big_moves) > 0:
+    print(big_moves)
+
+import matplotlib.pyplot as plt
+plt.figure(figsize=(13, 5))
+plt.plot(vedl_check.index, vedl_check)
+plt.title("VEDL.NS — 2-Year Price History (sanity check)")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+#Step 8
+def calculate_macd(prices, fast=12, slow=26, signal=9):
+    ema_fast = prices.ewm(span=fast, adjust=False).mean()
+    ema_slow = prices.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    return macd_line, signal_line, macd_line - signal_line
+
+macd_results = []
+flagged_corporate_action = []
+
+for ticker in data_200.columns:
+    prices = data_200[ticker]
+
+    # Corporate action guard — same check that caught VEDL
+    daily_pct_change = prices.pct_change()
+    if (daily_pct_change.abs() > 0.15).any():
+        flagged_corporate_action.append(ticker)
+        continue  # skip — MACD would be corrupted by the same averaging-across-the-cliff issue
+
+    macd_line, signal_line, macd_hist = calculate_macd(prices)
+    latest_macd = macd_line.iloc[-1]
+    latest_signal = signal_line.iloc[-1]
+    latest_hist = macd_hist.iloc[-1]
+
+    if pd.isna(latest_hist):
+        continue
+
+    # Normalize histogram as % of price — this is what fixes the SHREECEM problem
+    # (a stock at ₹26,000 will always have a bigger raw MACD number than one at ₹200,
+    #  even for an identical % move, unless we scale it)
+    hist_pct = (latest_hist / prices.iloc[-1]) * 100
+
+    # Detect a recent crossover (last 10 days)
+    diff = macd_line - signal_line
+    recent_diff = diff.tail(10)
+    crossed_bullish = (recent_diff.iloc[0] < 0) and (recent_diff.iloc[-1] > 0)
+    crossed_bearish = (recent_diff.iloc[0] > 0) and (recent_diff.iloc[-1] < 0)
+
+    if latest_hist > 0:
+        signal = "Bullish crossover (recent!)" if crossed_bullish else "Momentum accelerating up"
+    else:
+        signal = "Bearish crossover (recent!)" if crossed_bearish else "Momentum accelerating down"
+
+    macd_results.append({
+        "ticker": ticker, "macd_hist_raw": round(latest_hist, 2),
+        "macd_hist_pct": round(hist_pct, 3), "signal": signal
+    })
+
+macd_table = pd.DataFrame(macd_results).set_index("ticker").sort_values("macd_hist_pct", ascending=False)
+
+print(f"MACD computed for {len(macd_table)} of 200 stocks")
+print(f"Flagged and excluded for corporate action anomaly ({len(flagged_corporate_action)}): {flagged_corporate_action}\n")
+
+print("=== Top 15 by normalized MACD histogram (% of price) ===")
+print(macd_table.head(15))
+print("\n=== Bottom 15 by normalized MACD histogram (% of price) ===")
+print(macd_table.tail(15))
+
+print(f"\n=== Summary ===")
+print(f"Positive histogram (momentum up): {(macd_table['macd_hist_pct'] > 0).sum()} stocks")
+print(f"Negative histogram (momentum down): {(macd_table['macd_hist_pct'] < 0).sum()} stocks")
+print(f"Recent bullish crossovers: {(macd_table['signal'] == 'Bullish crossover (recent!)').sum()}")
+print(f"Recent bearish crossovers: {(macd_table['signal'] == 'Bearish crossover (recent!)').sum()}")
+
+original_five = ["UPL.NS", "COALINDIA.NS", "TATACONSUM.NS", "JSWSTEEL.NS", "NTPC.NS"]
+print("\n=== Original 5, in context ===")
+for ticker in original_five:
+    if ticker in macd_table.index:
+        rank = (macd_table['macd_hist_pct'] < macd_table.loc[ticker, 'macd_hist_pct']).sum()
+        percentile = rank / len(macd_table) * 100
+        print(f"{ticker}: hist {macd_table.loc[ticker,'macd_hist_pct']:.3f}% — {percentile:.0f}th percentile — {macd_table.loc[ticker,'signal']}")
+    elif ticker in flagged_corporate_action:
+        print(f"{ticker}: excluded — corporate action flagged")
+    else:
+        print(f"{ticker}: not enough history")
+
+#Step 9: 
+# Need Volume data — data_200 only has Close, so pull volume separately
+volume_200 = yf.download(list(data_200.columns), period="2y", auto_adjust=True)["Volume"]
+volume_200 = volume_200.ffill()
+
+print(f"Volume data: {volume_200.shape[1]} stocks, {len(volume_200)} trading days")
+
+volume_results = []
+
+for ticker in data_200.columns:
+    if ticker not in volume_200.columns:
+        continue
+
+    vol = volume_200[ticker]
+    price = data_200[ticker]
+
+    latest_volume = vol.iloc[-1]
+    avg_volume_20d = vol.tail(21).iloc[:-1].mean()  # 20-day average, excluding today
+
+    if pd.isna(avg_volume_20d) or avg_volume_20d == 0:
+        continue
+
+    volume_ratio = latest_volume / avg_volume_20d
+
+    # Accumulation/Distribution proxy: on up days recently, is volume higher than on down days?
+    # This tells us whether buying or selling is happening with more conviction
+    recent_returns = price.pct_change().tail(20)
+    recent_volume = vol.tail(20)
+    up_day_volume = recent_volume[recent_returns > 0].mean()
+    down_day_volume = recent_volume[recent_returns < 0].mean()
+
+    if pd.isna(up_day_volume) or pd.isna(down_day_volume) or down_day_volume == 0:
+        accumulation_ratio = np.nan
+    else:
+        accumulation_ratio = up_day_volume / down_day_volume
+
+    if volume_ratio > 1.5:
+        signal = "High volume — strong conviction"
+    elif volume_ratio > 1.0:
+        signal = "Above-average volume"
+    else:
+        signal = "Below-average volume — weak conviction"
+
+    volume_results.append({
+        "ticker": ticker, "volume_ratio": round(volume_ratio, 2),
+        "accumulation_ratio": round(accumulation_ratio, 2) if not pd.isna(accumulation_ratio) else None,
+        "signal": signal
+    })
+
+volume_table = pd.DataFrame(volume_results).set_index("ticker").sort_values("volume_ratio", ascending=False)
+
+print(f"\nVolume computed for {len(volume_table)} of 200 stocks\n")
+print("=== Top 15 by volume ratio (today vs 20-day average) ===")
+print(volume_table.head(15))
+print("\n=== Bottom 15 by volume ratio ===")
+print(volume_table.tail(15))
+
+print(f"\n=== Summary ===")
+print(f"High volume (>1.5x average): {(volume_table['volume_ratio'] > 1.5).sum()} stocks")
+print(f"Above average (1.0-1.5x): {((volume_table['volume_ratio'] > 1.0) & (volume_table['volume_ratio'] <= 1.5)).sum()} stocks")
+print(f"Below average (<1.0x): {(volume_table['volume_ratio'] <= 1.0).sum()} stocks")
+
+original_five = ["UPL.NS", "COALINDIA.NS", "TATACONSUM.NS", "JSWSTEEL.NS", "NTPC.NS"]
+print("\n=== Original 5, in context ===")
+for ticker in original_five:
+    if ticker in volume_table.index:
+        rank = (volume_table['volume_ratio'] < volume_table.loc[ticker, 'volume_ratio']).sum()
+        percentile = rank / len(volume_table) * 100
+        row = volume_table.loc[ticker]
+        print(f"{ticker}: vol_ratio {row['volume_ratio']:.2f}x — {percentile:.0f}th percentile — "
+              f"accum_ratio {row['accumulation_ratio']} — {row['signal']}")
+
+
+#Step 10: 
+
+
+def calculate_52w_high_proximity(prices, window=252):
+    return (prices / prices.rolling(window).max()) * 100
+
+def calculate_resistance_breakout(close, window=60):
+    resistance = close.shift(1).rolling(window).max()
+    breakout = close > resistance
+    return resistance, breakout
+
+high52_results = []
+flagged_ca_52w = []
+
+for ticker in data_200.columns:
+    prices = data_200[ticker]
+
+    # Same corporate-action guard as MACD — even more critical here,
+    # since 52-week high is directly comparing today's price to history
+    daily_pct_change = prices.pct_change()
+    if (daily_pct_change.abs() > 0.15).any():
+        flagged_ca_52w.append(ticker)
+        continue
+
+    proximity = calculate_52w_high_proximity(prices)
+    latest_proximity = proximity.iloc[-1]
+
+    if pd.isna(latest_proximity):
+        continue  # not enough history yet
+
+    resistance, breakout = calculate_resistance_breakout(prices, window=60)
+    recent_breakout = breakout.tail(5).any()  # any breakout in the last week
+
+    if latest_proximity >= 98:
+        signal = "At/near 52-week high"
+    elif latest_proximity >= 90:
+        signal = "Within striking distance"
+    elif latest_proximity >= 75:
+        signal = "Moderate pullback from high"
+    else:
+        signal = "Well off 52-week high"
+
+    if recent_breakout:
+        signal += " + recent breakout"
+
+    high52_results.append({
+        "ticker": ticker, "pct_of_52w_high": round(latest_proximity, 2),
+        "recent_breakout": recent_breakout, "signal": signal
+    })
+
+high52_table = pd.DataFrame(high52_results).set_index("ticker").sort_values("pct_of_52w_high", ascending=False)
+
+print(f"52-week high test computed for {len(high52_table)} of 200 stocks")
+print(f"Flagged and excluded for corporate action ({len(flagged_ca_52w)}): {flagged_ca_52w}\n")
+
+print("=== Top 15 closest to 52-week high ===")
+print(high52_table.head(15))
+print("\n=== Bottom 15 furthest from 52-week high ===")
+print(high52_table.tail(15))
+
+print(f"\n=== Summary ===")
+print(f"At/near high (>=98%): {(high52_table['pct_of_52w_high'] >= 98).sum()} stocks")
+print(f"Within striking distance (90-98%): {((high52_table['pct_of_52w_high'] >= 90) & (high52_table['pct_of_52w_high'] < 98)).sum()} stocks")
+print(f"Well off high (<75%): {(high52_table['pct_of_52w_high'] < 75).sum()} stocks")
+print(f"Stocks with a breakout in the last 5 days: {high52_table['recent_breakout'].sum()}")
+
+original_five = ["UPL.NS", "COALINDIA.NS", "TATACONSUM.NS", "JSWSTEEL.NS", "NTPC.NS"]
+print("\n=== Original 5, in context ===")
+for ticker in original_five:
+    if ticker in high52_table.index:
+        rank = (high52_table['pct_of_52w_high'] < high52_table.loc[ticker, 'pct_of_52w_high']).sum()
+        percentile = rank / len(high52_table) * 100
+        row = high52_table.loc[ticker]
+        print(f"{ticker}: {row['pct_of_52w_high']:.2f}% of 52w high — {percentile:.0f}th percentile — {row['signal']}")
+    elif ticker in flagged_ca_52w:
+        print(f"{ticker}: excluded — corporate action flagged")
+
+# Step 11:
+
+# Pull Nifty 50 index data if not already in session
+nifty = yf.download("^NSEI", period="2y", auto_adjust=True)["Close"]
+nifty = nifty.squeeze().ffill()
+
+print(f"Nifty data: {len(nifty)} trading days, latest: {nifty.iloc[-1]:.2f}")
+
+relative_results = []
+flagged_ca_rel = []
+
+for ticker in data_200.columns:
+    prices = data_200[ticker]
+
+    # Same corporate-action guard as the last two tests
+    daily_pct_change = prices.pct_change()
+    if (daily_pct_change.abs() > 0.15).any():
+        flagged_ca_rel.append(ticker)
+        continue
+
+    # Align stock and index on the same dates
+    aligned_nifty = nifty.reindex(prices.index).ffill()
+
+    # Returns over multiple windows: 1-month (21 days), 3-month (63 days), 1-year (252 days)
+    windows = {"1m": 21, "3m": 63, "1y": 252}
+    row = {"ticker": ticker}
+
+    for label, days in windows.items():
+        if len(prices) < days + 1:
+            row[f"stock_ret_{label}"] = np.nan
+            row[f"alpha_{label}"] = np.nan
+            continue
+        stock_ret = (prices.iloc[-1] / prices.iloc[-days-1] - 1) * 100
+        index_ret = (aligned_nifty.iloc[-1] / aligned_nifty.iloc[-days-1] - 1) * 100
+        row[f"stock_ret_{label}"] = round(stock_ret, 2)
+        row[f"alpha_{label}"] = round(stock_ret - index_ret, 2)  # outperformance vs Nifty
+
+    relative_results.append(row)
+
+relative_table = pd.DataFrame(relative_results).set_index("ticker")
+relative_table = relative_table.dropna(subset=["alpha_3m"]).sort_values("alpha_3m", ascending=False)
+
+# Simple combined signal based on 3-month alpha (main momentum window) with 1-year context
+def classify(row):
+    if pd.isna(row["alpha_3m"]):
+        return "Insufficient history"
+    if row["alpha_3m"] > 5:
+        strength = "Strong outperformer"
+    elif row["alpha_3m"] > 0:
+        strength = "Mild outperformer"
+    else:
+        strength = "Underperformer"
+    if not pd.isna(row.get("alpha_1y")):
+        consistency = " (consistent w/ 1yr)" if (row["alpha_3m"] > 0) == (row["alpha_1y"] > 0) else " (diverges from 1yr trend)"
+    else:
+        consistency = ""
+    return strength + consistency
+
+relative_table["signal"] = relative_table.apply(classify, axis=1)
+
+print(f"\nRelative performance computed for {len(relative_table)} of 200 stocks")
+print(f"Flagged and excluded for corporate action ({len(flagged_ca_rel)}): {flagged_ca_rel}\n")
+
+print("=== Top 15 by 3-month alpha vs Nifty ===")
+print(relative_table[["alpha_1m", "alpha_3m", "alpha_1y", "signal"]].head(15))
+print("\n=== Bottom 15 by 3-month alpha vs Nifty ===")
+print(relative_table[["alpha_1m", "alpha_3m", "alpha_1y", "signal"]].tail(15))
+
+print(f"\n=== Summary ===")
+print(f"Outperforming Nifty over 3mo: {(relative_table['alpha_3m'] > 0).sum()} of {len(relative_table)} stocks")
+print(f"Outperforming Nifty over 1yr: {(relative_table['alpha_1y'] > 0).sum()} of {relative_table['alpha_1y'].notna().sum()} stocks")
+
+original_five = ["UPL.NS", "COALINDIA.NS", "TATACONSUM.NS", "JSWSTEEL.NS", "NTPC.NS"]
+print("\n=== Original 5, in context ===")
+for ticker in original_five:
+    if ticker in relative_table.index:
+        rank = (relative_table['alpha_3m'] < relative_table.loc[ticker, 'alpha_3m']).sum()
+        percentile = rank / len(relative_table) * 100
+        row = relative_table.loc[ticker]
+        print(f"{ticker}: 1m alpha {row['alpha_1m']:+.2f}% | 3m alpha {row['alpha_3m']:+.2f}% | "
+              f"1y alpha {row['alpha_1y']:+.2f}% — {percentile:.0f}th percentile — {row['signal']}")
+    elif ticker in flagged_ca_rel:
+        print(f"{ticker}: excluded — corporate action flagged")
+
+#Step 12
+
+def calculate_bollinger_bands(prices, window=20, num_std=2):
+    middle_band = prices.rolling(window).mean()
+    rolling_std = prices.rolling(window).std()
+    upper_band = middle_band + (num_std * rolling_std)
+    lower_band = middle_band - (num_std * rolling_std)
+    
+    # %B: where is price within the bands? 0 = at lower band, 1 = at upper band, >1 = above upper, <0 = below lower
+    percent_b = (prices - lower_band) / (upper_band - lower_band)
+    
+    # Bandwidth: how wide are the bands relative to price? Narrow bands = low volatility, often precedes a big move
+    bandwidth = (upper_band - lower_band) / middle_band * 100
+    
+    return middle_band, upper_band, lower_band, percent_b, bandwidth
+
+bb_results = []
+flagged_ca_bb = []
+
+for ticker in data_200.columns:
+    prices = data_200[ticker]
+
+    daily_pct_change = prices.pct_change()
+    if (daily_pct_change.abs() > 0.15).any():
+        flagged_ca_bb.append(ticker)
+        continue
+
+    middle, upper, lower, percent_b, bandwidth = calculate_bollinger_bands(prices)
+    
+    latest_percent_b = percent_b.iloc[-1]
+    latest_bandwidth = bandwidth.iloc[-1]
+    
+    if pd.isna(latest_percent_b):
+        continue
+
+    # Is bandwidth unusually narrow right now vs its own recent history? (a "squeeze" — often precedes a breakout)
+    bandwidth_percentile_own_history = (bandwidth.tail(252) < latest_bandwidth).mean() * 100
+
+    if latest_percent_b > 1.0:
+        signal = "Above upper band — strong breakout or overbought"
+    elif latest_percent_b > 0.8:
+        signal = "Near upper band — strong/overbought zone"
+    elif latest_percent_b < 0.0:
+        signal = "Below lower band — strong breakdown or oversold"
+    elif latest_percent_b < 0.2:
+        signal = "Near lower band — weak/oversold zone"
+    else:
+        signal = "Middle range — no extreme"
+
+    if bandwidth_percentile_own_history < 10:
+        signal += " + SQUEEZE (unusually tight bands, watch for breakout)"
+
+    bb_results.append({
+        "ticker": ticker,
+        "percent_b": round(latest_percent_b, 3),
+        "bandwidth_pct": round(latest_bandwidth, 2),
+        "bandwidth_percentile_own_history": round(bandwidth_percentile_own_history, 1),
+        "signal": signal
+    })
+
+bb_table = pd.DataFrame(bb_results).set_index("ticker").sort_values("percent_b", ascending=False)
+
+print(f"Bollinger Bands computed for {len(bb_table)} of 200 stocks")
+print(f"Flagged and excluded for corporate action ({len(flagged_ca_bb)}): {flagged_ca_bb}\n")
+
+print("=== Top 15 by %B (closest to / above upper band) ===")
+print(bb_table.head(15))
+print("\n=== Bottom 15 by %B (closest to / below lower band) ===")
+print(bb_table.tail(15))
+
+print(f"\n=== Summary ===")
+print(f"Above upper band: {(bb_table['percent_b'] > 1.0).sum()} stocks")
+print(f"Below lower band: {(bb_table['percent_b'] < 0.0).sum()} stocks")
+print(f"Currently in a squeeze (tight bands): {bb_table['signal'].str.contains('SQUEEZE').sum()} stocks")
+
+original_five = ["UPL.NS", "COALINDIA.NS", "TATACONSUM.NS", "JSWSTEEL.NS", "NTPC.NS"]
+print("\n=== Original 5, in context ===")
+for ticker in original_five:
+    if ticker in bb_table.index:
+        rank = (bb_table['percent_b'] < bb_table.loc[ticker, 'percent_b']).sum()
+        percentile = rank / len(bb_table) * 100
+        row = bb_table.loc[ticker]
+        print(f"{ticker}: %B {row['percent_b']:.3f} — {percentile:.0f}th percentile — bandwidth {row['bandwidth_pct']:.2f}% "
+              f"(own-history percentile: {row['bandwidth_percentile_own_history']:.0f}%) — {row['signal']}")
+
+#Step 13
+
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import numpy as np
+import pandas as pd
+
+tickers_hm = ["UPL.NS", "COALINDIA.NS", "TATACONSUM.NS", "JSWSTEEL.NS", "NTPC.NS"]
+
+# Monthly returns for each stock
+monthly_prices_hm = data_200[tickers_hm].resample("ME").last()
+monthly_returns_hm = monthly_prices_hm.pct_change() * 100
+
+# Add Nifty as a benchmark row
+nifty_monthly = nifty.resample("ME").last().pct_change() * 100
+nifty_monthly = nifty_monthly.reindex(monthly_returns_hm.index)
+
+# Combine into one table, Nifty first for easy visual comparison
+heatmap_data = monthly_returns_hm.copy()
+heatmap_data.insert(0, "NIFTY 50", nifty_monthly)
+heatmap_data = heatmap_data.dropna(how="all").tail(24)  # last 24 months
+
+# Transpose so stocks are rows, months are columns
+heatmap_data = heatmap_data.T
+heatmap_data.columns = [d.strftime("%b %Y") for d in heatmap_data.columns]
+
+fig, ax = plt.subplots(figsize=(16, 4))
+
+# Diverging colormap: red for negative, green for positive, white near zero
+vmax = np.nanmax(np.abs(heatmap_data.values))
+im = ax.imshow(heatmap_data.values, cmap="RdYlGn", vmin=-vmax, vmax=vmax, aspect="auto")
+
+ax.set_xticks(range(len(heatmap_data.columns)))
+ax.set_xticklabels(heatmap_data.columns, rotation=45, ha="right", fontsize=8)
+ax.set_yticks(range(len(heatmap_data.index)))
+ax.set_yticklabels(heatmap_data.index, fontsize=10)
+
+# Annotate each cell with the actual % value
+for i in range(heatmap_data.shape[0]):
+    for j in range(heatmap_data.shape[1]):
+        val = heatmap_data.values[i, j]
+        if not np.isnan(val):
+            ax.text(j, i, f"{val:.1f}", ha="center", va="center", fontsize=7,
+                     color="black" if abs(val) < vmax*0.6 else "white")
+
+ax.set_title("Monthly Returns Heatmap — Original 5 Picks vs Nifty 50 (last 24 months)", fontsize=12)
+plt.colorbar(im, ax=ax, label="Monthly Return (%)", shrink=0.8)
+plt.tight_layout()
+plt.show()
+
+
+#Step 14
+
+def plot_seasonality_heatmap(ticker, data_200):
+    monthly_ret = data_200[ticker].resample("ME").last().pct_change() * 100
+    monthly_ret = monthly_ret.dropna()
+
+    df = pd.DataFrame({
+        "year": monthly_ret.index.year,
+        "month": monthly_ret.index.strftime("%b"),
+        "return": monthly_ret.values
+    })
+
+    pivot = df.pivot(index="year", columns="month", values="return")
+    month_order = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    pivot = pivot.reindex(columns=[m for m in month_order if m in pivot.columns])
+
+    fig, ax = plt.subplots(figsize=(10, max(2, len(pivot)*0.6)))
+    vmax = np.nanmax(np.abs(pivot.values))
+    im = ax.imshow(pivot.values, cmap="RdYlGn", vmin=-vmax, vmax=vmax, aspect="auto")
+
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_xticklabels(pivot.columns)
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels(pivot.index)
+
+    for i in range(pivot.shape[0]):
+        for j in range(pivot.shape[1]):
+            val = pivot.values[i, j]
+            if not np.isnan(val):
+                ax.text(j, i, f"{val:.1f}", ha="center", va="center", fontsize=8,
+                         color="black" if abs(val) < vmax*0.6 else "white")
+
+    ax.set_title(f"{ticker} — Monthly Returns by Year (%)")
+    plt.colorbar(im, ax=ax, label="Return (%)", shrink=0.8)
+    plt.tight_layout()
+    plt.show()
+
+# Try it on your top pick
+plot_seasonality_heatmap("JSWSTEEL.NS", data_200)
+#Step 15
+# Pull 10 years of history specifically for JSWSTEEL — enough years to spot real seasonal patterns
+jswsteel_long = yf.download("JSWSTEEL.NS", period="10y", auto_adjust=True)["Close"]
+jswsteel_long = jswsteel_long.squeeze().ffill()
+
+print(f"JSWSTEEL.NS — {len(jswsteel_long)} trading days")
+print(f"Date range: {jswsteel_long.index.min().date()} to {jswsteel_long.index.max().date()}")
+
+# Quick corporate-action check before trusting it — same discipline as always
+daily_pct_change = jswsteel_long.pct_change()
+big_moves = daily_pct_change[daily_pct_change.abs() > 0.15]
+print(f"\nDays with >15% single-day move: {len(big_moves)}")
+if len(big_moves) > 0:
+    print(big_moves)
+
+#Step16
+def plot_seasonality_heatmap(prices, ticker_name):
+    monthly_ret = prices.resample("ME").last().pct_change() * 100
+    monthly_ret = monthly_ret.dropna()
+
+    df = pd.DataFrame({
+        "year": monthly_ret.index.year,
+        "month": monthly_ret.index.strftime("%b"),
+        "return": monthly_ret.values
+    })
+
+    pivot = df.pivot(index="year", columns="month", values="return")
+    month_order = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    pivot = pivot.reindex(columns=[m for m in month_order if m in pivot.columns])
+
+    fig, ax = plt.subplots(figsize=(11, max(3, len(pivot)*0.55)))
+    vmax = np.nanmax(np.abs(pivot.values))
+    im = ax.imshow(pivot.values, cmap="RdYlGn", vmin=-vmax, vmax=vmax, aspect="auto")
+
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_xticklabels(pivot.columns)
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels(pivot.index)
+
+    for i in range(pivot.shape[0]):
+        for j in range(pivot.shape[1]):
+            val = pivot.values[i, j]
+            if not np.isnan(val):
+                ax.text(j, i, f"{val:.1f}", ha="center", va="center", fontsize=8,
+                         color="black" if abs(val) < vmax*0.6 else "white")
+
+    ax.set_title(f"{ticker_name} — Monthly Returns by Year (%), 10-Year History")
+    plt.colorbar(im, ax=ax, label="Return (%)", shrink=0.8)
+    plt.tight_layout()
+    plt.show()
+
+    # Bonus: average return by calendar month, across all years — the actual "seasonality" signal
+    avg_by_month = pivot.mean(axis=0).reindex([m for m in month_order if m in pivot.columns])
+    print("Average return by calendar month (across all years):")
+    print(avg_by_month.round(2))
+
+    # How many years was each month positive vs negative?
+    win_rate = (pivot > 0).mean(axis=0) * 100
+    print("\n% of years each month was positive:")
+    print(win_rate.round(0))
+
+plot_seasonality_heatmap(jswsteel_long, "JSWSTEEL.NS")
+
+
+Step15
+
+monthly_ret = jswsteel_long.resample("ME").last().pct_change() * 100
+april_returns = monthly_ret[monthly_ret.index.month == 4]
+print(april_returns)
+
+
+Step16
+
+# Average with 2021 excluded, to see the "normal year" picture
+april_ex_2021 = april_returns[april_returns.index.year != 2021]
+print(f"April average WITH 2021: {april_returns.mean():.2f}%")
+print(f"April average WITHOUT 2021: {april_ex_2021.mean():.2f}%")
+print(f"\nApril years excluding 2021:\n{april_ex_2021}")
